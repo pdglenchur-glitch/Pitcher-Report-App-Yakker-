@@ -8,16 +8,12 @@ import io
 import re
 from datetime import datetime
 
-# -------------------------------------------------------
 # Streamlit Page Setup
-# -------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Pitching Report Generator")
 st.title("⚾ Pitching Report Builder – Streamlit Edition")
 st.write("Upload multiple CSVs → choose pitcher → filter by date → generate full scouting report.")
 
-# -------------------------------------------------------
 # Helper: Extract date from filename (MM_DD_YY or MM_DD_YYYY)
-# -------------------------------------------------------
 def extract_date(filename):
     match = re.search(r"(\d{1,2})_(\d{1,2})_(\d{2,4})", filename)
     if match:
@@ -27,9 +23,7 @@ def extract_date(filename):
         return datetime(int(year), int(month), int(day))
     return None
 
-# -------------------------------------------------------
-# File Upload (Multi-Session)
-# -------------------------------------------------------
+# File Upload (Multi-Outing Support)
 uploaded_files = st.file_uploader(
     "Upload one or more CSV files (multi-session tracking supported)",
     type=["csv"],
@@ -58,9 +52,7 @@ for file in uploaded_files:
 df = pd.concat(df_list, ignore_index=True)
 st.success(f"Loaded {len(uploaded_files)} files with {len(df):,} total pitches.")
 
-# -------------------------------------------------------
 # Automatic Season Range
-# -------------------------------------------------------
 valid_dates = [d for d in file_dates if d is not None]
 
 if valid_dates:
@@ -70,9 +62,7 @@ if valid_dates:
 else:
     season_range = "Unknown Date Range"
 
-# -------------------------------------------------------
 # Date Filter UI (Before Pitcher Filter)
-# -------------------------------------------------------
 available_dates = sorted(df["SessionDate"].dropna().unique())
 
 selected_dates = st.multiselect(
@@ -84,9 +74,7 @@ selected_dates = st.multiselect(
 # Apply date filter to global df
 df = df[df["SessionDate"].isin(selected_dates)]
 
-# -------------------------------------------------------
 # Select Pitcher
-# -------------------------------------------------------
 pitchers = sorted(df["Pitcher"].dropna().unique().tolist())
 selected_pitcher = st.selectbox("Select a pitcher:", pitchers)
 
@@ -103,9 +91,7 @@ p = p[p["RelSpeed"].notna()]
 p = p.sort_values("PitchNo")
 p["PitchNo"] = range(1, len(p) + 1)
 
-# -------------------------------------------------------
 # Summary Stats
-# -------------------------------------------------------
 total_pitches = len(p)
 avg_velo = p["RelSpeed"].mean()
 max_velo = p["RelSpeed"].max()
@@ -123,9 +109,7 @@ pitch_types = p["TaggedPitchType"].unique().tolist()
 palette = sns.color_palette("husl", n_colors=len(pitch_types))
 colors = {pt: palette[i] for i, pt in enumerate(pitch_types)}
 
-# -------------------------------------------------------
 # Build Full Figure Layout
-# -------------------------------------------------------
 fig = plt.figure(figsize=(17, 13), dpi=150)
 gs = gridspec.GridSpec(
     7, 4,
@@ -134,14 +118,14 @@ gs = gridspec.GridSpec(
     wspace=1.05
 )
 
-# ------------------ HEADER ----------------------------
+# Header
 ax_header = fig.add_subplot(gs[0,:])
 ax_header.axis("off")
 ax_header.text(0, 0.65, f"{selected_pitcher}", fontsize=26, weight="bold")
 ax_header.text(0.78, 0.60, f"Outing Summary\n{season_range}",
                fontsize=14, ha="right")
 
-# ------------------ SUMMARY BAR -----------------------
+# Summary Bar
 ax_sum = fig.add_subplot(gs[1,:])
 ax_sum.axis("off")
 
@@ -155,7 +139,7 @@ for i, (lab, val) in enumerate(zip(summary_labels, summary_values)):
                                    fill=False, linewidth=1))
     ax_sum.text(x_left + width / 2, 0.32, val, fontsize=12, ha="center")
 
-# ------------------ MOVEMENT CHART --------------------
+# Movement Chart
 ax_mvmt = fig.add_subplot(gs[2:5, 0:2])
 
 for pt in pitch_types:
@@ -173,7 +157,7 @@ ax_mvmt.set_ylabel("Induced Vertical Break (in)")
 ax_mvmt.legend(frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
 ax_mvmt.grid(alpha=0.25, linestyle="--")
 
-# ------------------ VELOCITY OVER TIME ----------------
+# Juice over time 
 ax_velo = fig.add_subplot(gs[2:3, 2:4])
 
 for pt in pitch_types:
@@ -190,7 +174,7 @@ ax_velo.set_ylabel("Velocity (mph)")
 ax_velo.grid(alpha=0.3)
 ax_velo.legend(frameon=False, bbox_to_anchor=(1.1, 1), loc="upper left")
 
-# ------------------ STRIKE ZONE HEATMAP ---------------
+# Fill it up visualization
 ax_heat = fig.add_subplot(gs[3:5, 2:4])
 
 px = p["PlateLocSide"].values * 12   # feet → inches
@@ -216,7 +200,7 @@ ax_heat.set_xlabel("Plate Side (inches)")
 ax_heat.set_ylabel("Plate Height (ft)")
 ax_heat.grid(alpha=0.25, linestyle="--")
 
-# ------------------ SUMMARY TABLE ---------------------
+# How nasty is the stuff
 ax_tbl = fig.add_subplot(gs[6,:])
 ax_tbl.axis("off")
 
@@ -268,14 +252,9 @@ tbl.auto_set_font_size(False)
 tbl.set_fontsize(10)
 ax_tbl.set_title("Pitch Type Summary", fontsize=16, weight="bold", pad=18)
 
-# -------------------------------------------------------
-# Render Figure
-# -------------------------------------------------------
 st.pyplot(fig)
 
-# -------------------------------------------------------
 # Download Button
-# -------------------------------------------------------
 buffer = io.BytesIO()
 fig.savefig(buffer, format="png", bbox_inches="tight")
 buffer.seek(0)

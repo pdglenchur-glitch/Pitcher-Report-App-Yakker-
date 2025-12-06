@@ -23,7 +23,7 @@ def extract_date(filename):
         return datetime(int(year), int(month), int(day))
     return None
 
-# File Upload (Multi-Outing Support)
+# File Upload
 uploaded_files = st.file_uploader(
     "Upload one or more CSV files (multi-session tracking supported)",
     type=["csv"],
@@ -38,8 +38,6 @@ file_dates = []
 
 for file in uploaded_files:
     temp = pd.read_csv(file)
-    
-    # Extract session date from filename
     session_date = extract_date(file.name)
 
     temp["SourceFile"] = file.name
@@ -48,13 +46,11 @@ for file in uploaded_files:
     df_list.append(temp)
     file_dates.append(session_date)
 
-# Combine all files
 df = pd.concat(df_list, ignore_index=True)
 st.success(f"Loaded {len(uploaded_files)} files with {len(df):,} total pitches.")
 
-# Automatic Season Range
+# Season Date Range
 valid_dates = [d for d in file_dates if d is not None]
-
 if valid_dates:
     start_date = min(valid_dates)
     end_date = max(valid_dates)
@@ -71,45 +67,69 @@ selected_dates = st.multiselect(
     default=available_dates
 )
 
-# Apply date filter to global df
 df = df[df["SessionDate"].isin(selected_dates)]
 
-# Select Pitcher
+# Pitcher Selection
 pitchers = sorted(df["Pitcher"].dropna().unique().tolist())
 selected_pitcher = st.selectbox("Select a pitcher:", pitchers)
 
-# Filter to selected pitcher
 p = df[df["Pitcher"] == selected_pitcher].copy()
 
 if p.empty:
     st.warning("No data for this pitcher in the selected date range.")
     st.stop()
 
-# Clean / reorder
+# Clean & Reorder
 p = p[p["TaggedPitchType"].notna()]
 p = p[p["RelSpeed"].notna()]
 p = p.sort_values("PitchNo")
 p["PitchNo"] = range(1, len(p) + 1)
 
-# Summary Stats
+# SUMMARY STATS
 total_pitches = len(p)
 avg_velo = p["RelSpeed"].mean()
 max_velo = p["RelSpeed"].max()
 min_velo = p["RelSpeed"].min()
 
-summary_labels = ["Pitches", "Avg Velo", "Max Velo", "Min Velo"]
+# PZR CALCULATION FUNCTION
+margin_in = 2.85
+margin_ft = margin_in / 12
+
+# Base strike zone
+sx_left  = -8.5 - margin_in
+sx_right =  8.5 + margin_in
+sz_bot   = 1.5 - margin_ft
+sz_top   = 3.5 + margin_ft
+
+def compute_pzr(sub):
+    px = sub["PlateLocSide"] * 12   # convert feet → inches
+    pz = sub["PlateLocHeight"]
+    pzr_mask = (
+        (px >= sx_left) &
+        (px <= sx_right) &
+        (pz >= sz_bot) &
+        (pz <= sz_top)
+    )
+    return pzr_mask.mean() * 100
+
+overall_pzr = compute_pzr(p)
+
+# SUMMARY BOX ROW (WITH PZR ADDED)
+summary_labels = ["Pitches", "Avg Velo", "Max Velo", "Min Velo", "PZR%"]
 summary_values = [
     f"{total_pitches}",
     f"{avg_velo:.1f}",
     f"{max_velo:.1f}",
     f"{min_velo:.1f}",
+    f"{overall_pzr:.1f}%"
 ]
 
+# PITCH COLORS
 pitch_types = p["TaggedPitchType"].unique().tolist()
 palette = sns.color_palette("husl", n_colors=len(pitch_types))
 colors = {pt: palette[i] for i, pt in enumerate(pitch_types)}
 
-# Build Full Figure Layout
+# FIGURE LAYOUT
 fig = plt.figure(figsize=(17, 13), dpi=150)
 gs = gridspec.GridSpec(
     7, 4,
@@ -118,14 +138,14 @@ gs = gridspec.GridSpec(
     wspace=1.05
 )
 
-# Header
+# HEADER
 ax_header = fig.add_subplot(gs[0,:])
 ax_header.axis("off")
 ax_header.text(0, 0.65, f"{selected_pitcher}", fontsize=26, weight="bold")
 ax_header.text(0.78, 0.60, f"Outing Summary\n{season_range}",
                fontsize=14, ha="right")
 
-# Summary Bar
+# SUMMARY BOXES
 ax_sum = fig.add_subplot(gs[1,:])
 ax_sum.axis("off")
 
@@ -139,7 +159,7 @@ for i, (lab, val) in enumerate(zip(summary_labels, summary_values)):
                                    fill=False, linewidth=1))
     ax_sum.text(x_left + width / 2, 0.32, val, fontsize=12, ha="center")
 
-# Movement Chart
+# PITCH MOVEMENT
 ax_mvmt = fig.add_subplot(gs[2:5, 0:2])
 
 for pt in pitch_types:
@@ -157,7 +177,12 @@ ax_mvmt.set_ylabel("Induced Vertical Break (in)")
 ax_mvmt.legend(frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
 ax_mvmt.grid(alpha=0.25, linestyle="--")
 
-# Juice over time 
+# Lock movement plot axes (prevents shifting)
+ax_mvmt.set_xlim(-25, 25)
+ax_mvmt.set_ylim(-25, 25)
+
+
+# VELOCITY OVER TIME
 ax_velo = fig.add_subplot(gs[2:3, 2:4])
 
 for pt in pitch_types:
@@ -174,33 +199,49 @@ ax_velo.set_ylabel("Velocity (mph)")
 ax_velo.grid(alpha=0.3)
 ax_velo.legend(frameon=False, bbox_to_anchor=(1.1, 1), loc="upper left")
 
-# Fill it up visualization
+# STRIKE ZONE HEATMAP
 ax_heat = fig.add_subplot(gs[3:5, 2:4])
 
-px = p["PlateLocSide"].values * 12   # feet → inches
-pz = p["PlateLocHeight"].values
+# Fixed boundaries
+x_min, x_max = -20, 20
+y_min, y_max = 0, 5.5
 
-ax_heat.hexbin(
-    px, pz,
-    gridsize=25,
-    cmap="coolwarm",
-    bins='log',
-    mincnt=1,
-    linewidths=0.25
-)
+# Scatter points with clamping for out-of-bounds pitches
+for pt in pitch_types:
+    sub = p[p["TaggedPitchType"] == pt]
 
-# Strike zone boundaries
+    px = sub["PlateLocSide"].values * 12   # convert to inches
+    pz = sub["PlateLocHeight"].values
+
+    # Clamp to boundaries
+    px_clamped = np.clip(px, x_min, x_max)
+    pz_clamped = np.clip(pz, y_min, y_max)
+
+    ax_heat.scatter(
+        px_clamped,
+        pz_clamped,
+        s=55,                       # your preferred size
+        color=colors[pt],
+        edgecolor="black",
+        linewidth=0.7,
+        alpha=0.9
+    )
+    
+#Strike Zone Boundaries
 ax_heat.axvline(-8.5, color="black", linestyle="--", linewidth=0.8)
 ax_heat.axvline(8.5,  color="black", linestyle="--", linewidth=0.8)
 ax_heat.axhline(1.5, color="black", linestyle="--", linewidth=0.8)
 ax_heat.axhline(3.5, color="black", linestyle="--", linewidth=0.8)
+
+ax_heat.set_xlim(-20, 20)
+ax_heat.set_ylim(0, 5.5)
 
 ax_heat.set_title("Strike Zone Heatmap", fontsize=14, weight="bold")
 ax_heat.set_xlabel("Plate Side (inches)")
 ax_heat.set_ylabel("Plate Height (ft)")
 ax_heat.grid(alpha=0.25, linestyle="--")
 
-# How nasty is the stuff
+# PITCH TYPE SUMMARY TABLE (WITH PZR%)
 ax_tbl = fig.add_subplot(gs[6,:])
 ax_tbl.axis("off")
 
@@ -212,7 +253,8 @@ def summarize(sub):
         sub["HorzBreak"].mean(),
         sub["SpinRate"].mean(),
         sub["HorzApprAngle"].mean(),
-        sub["VertApprAngle"].mean()
+        sub["VertApprAngle"].mean(),
+        compute_pzr(sub)               # <-- NEW PZR COLUMN
     ]
 
 rows = []
@@ -224,7 +266,8 @@ for pt in pitch_types:
     row_labels.append(pt)
 
 rows = np.array(rows)
-col_labels = ["Count", "Velo", "IVB", "HB", "Spin", "HAA", "VAA"]
+
+col_labels = ["Count", "Velo", "IVB", "HB", "Spin", "HAA", "VAA", "PZR%"]
 
 table_str = [
     [
@@ -234,7 +277,8 @@ table_str = [
         f"{r[3]:.1f}",
         f"{r[4]:.0f}" if not np.isnan(r[4]) else "–",
         f"{r[5]:.2f}" if not np.isnan(r[5]) else "–",
-        f"{r[6]:.2f}" if not np.isnan(r[6]) else "–"
+        f"{r[6]:.2f}" if not np.isnan(r[6]) else "–",
+        f"{r[7]:.1f}%"               # <-- NEW PZR COLUMN DISPLAY
     ]
     for r in rows
 ]
@@ -252,6 +296,7 @@ tbl.auto_set_font_size(False)
 tbl.set_fontsize(10)
 ax_tbl.set_title("Pitch Type Summary", fontsize=16, weight="bold", pad=18)
 
+# Streamlit Output
 st.pyplot(fig)
 
 # Download Button
@@ -265,4 +310,3 @@ st.download_button(
     file_name=f"{selected_pitcher.replace(' ','_')}_report.png",
     mime="image/png"
 )
-#End of Script

@@ -2,13 +2,13 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
-  workflow_dispatch:        # allows manual run
+    - cron: "*/5 * * * *"   # Run every 5 minutes
+  workflow_dispatch:        # Allows manual runs
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: CURL Ping Streamlit App
+      - name: Ping Streamlit App
         run: |
           curl -L --silent https://pitcherreportyakker.streamlit.app/ > /dev/null

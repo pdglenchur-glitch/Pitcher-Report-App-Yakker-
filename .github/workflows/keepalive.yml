@@ -2,8 +2,8 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # Run every 5 minutes
-  workflow_dispatch:        # Allows manual runs
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 jobs:
   ping:
@@ -11,4 +11,7 @@ jobs:
     steps:
       - name: Ping Streamlit App
         run: |
-          curl -L --silent https://pitcherreportyakker.streamlit.app/ > /dev/null
+          echo "Pinging Streamlit app..."
+          curl --silent --show-error --location --max-time 30 https://pitcherreportyakker.streamlit.app/ || \
+          curl --silent --show-error --location --max-time 30 https://pitcherreportyakker.streamlit.app/
+          echo "Ping successful."

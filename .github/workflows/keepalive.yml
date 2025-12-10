@@ -2,7 +2,7 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-      - cron: "*/5 * * * *"
+    - cron: '*/5 * * * *'  # Every 5 minutes - use single quotes
   workflow_dispatch:
 
 jobs:
@@ -14,4 +14,3 @@ jobs:
           echo "Pinging Streamlit app..."
           curl --silent --location --max-redirs 0 https://pitcherreportyakker.streamlit.app/ || true
           echo "Ping completed."
-

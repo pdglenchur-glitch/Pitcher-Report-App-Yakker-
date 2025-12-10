@@ -2,12 +2,13 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # Every 5 minutes - use single quotes
+    - cron: '10 * * * *'
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Ping Streamlit App
         run: |

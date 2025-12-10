@@ -12,6 +12,6 @@ jobs:
       - name: Ping Streamlit App
         run: |
           echo "Pinging Streamlit app..."
-          curl --silent --show-error --location --max-time 30 https://pitcherreportyakker.streamlit.app/ || \
-          curl --silent --show-error --location --max-time 30 https://pitcherreportyakker.streamlit.app/
-          echo "Ping successful."
+          curl --silent --location --max-redirs 0 https://pitcherreportyakker.streamlit.app/ || true
+          echo "Ping completed."
+

@@ -27,7 +27,7 @@ def extract_date(filename):
         return datetime(int(year), int(month), int(day))
     return None
 
--
+
 #File Upload
 
 uploaded_files = st.file_uploader(
@@ -314,4 +314,5 @@ st.download_button(
     f"{selected_pitcher.replace(' ','_')}_report.png",
     "image/png"
 )
+
 

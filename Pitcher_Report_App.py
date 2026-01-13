@@ -95,10 +95,12 @@ p["PitchNo"] = range(1, len(p) + 1)
 
 p["IsBIP"] = p["ExitSpeed"].notna()
 p["GB"] = p["IsBIP"] & p["Angle"].between(-90, 10, inclusive="both")
+p["LD"] = p["IsBIP"] & p["Angle"].between(10, 25, inclusive="both")
 p["FB"] = p["IsBIP"] & p["Angle"].between(25, 90, inclusive="both")
 
 total_bip = p["IsBIP"].sum()
 overall_gb_pct = p["GB"].sum() / total_bip * 100 if total_bip > 0 else np.nan
+overall_ld_pct = p["LD"].sum() / total_bip * 100 if total_bip > 0 else np.nan
 overall_fb_pct = p["FB"].sum() / total_bip * 100 if total_bip > 0 else np.nan
 
 
@@ -126,10 +128,11 @@ overall_pzr = compute_pzr(p)
 
 #Summary Table
 
-summary_labels = ["Pitches", "GB%", "FB%", "Max Velo", "PZR%"]
+summary_labels = ["Pitches", "GB%", "LD%", "FB%", "Max Velo", "PZR%"]
 summary_values = [
     f"{total_pitches}",
     f"{overall_gb_pct:.1f}%" if not np.isnan(overall_gb_pct) else "–",
+    f"{overall_ld_pct:.1f}%" if not np.isnan(overall_ld_pct) else "–",
     f"{overall_fb_pct:.1f}%" if not np.isnan(overall_fb_pct) else "–",
     f"{max_velo:.1f}",
     f"{overall_pzr:.1f}%"
@@ -250,7 +253,9 @@ ax_tbl.axis("off")
 def summarize(sub):
     bip = sub["IsBIP"].sum()
     gb = sub["GB"].sum()
+    ld = sub["LD"].sum()
     fb = sub["FB"].sum()
+
     return [
         len(sub),
         sub["RelSpeed"].mean(),
@@ -261,6 +266,7 @@ def summarize(sub):
         sub["VertApprAngle"].mean(),
         compute_pzr(sub),
         gb / bip * 100 if bip > 0 else np.nan,
+        ld / bip * 100 if bip > 0 else np.nan,
         fb / bip * 100 if bip > 0 else np.nan,
         sub.loc[sub["IsBIP"], "ExitSpeed"].mean(),
         gb / fb if fb > 0 else np.nan
@@ -276,7 +282,7 @@ rows = np.array(rows)
 
 col_labels = [
     "Count", "Velo", "IVB", "HB", "Spin", "HAA", "VAA", "PZR%",
-    "GB%", "FB%", "Avg EV", "GB/FB"
+    "GB%", "LD%", "FB%", "Avg EV", "GB/FB"
 ]
 
 table_str = [[
@@ -284,8 +290,9 @@ table_str = [[
     f"{r[4]:.0f}", f"{r[5]:.2f}", f"{r[6]:.2f}", f"{r[7]:.1f}%",
     f"{r[8]:.1f}%" if not np.isnan(r[8]) else "–",
     f"{r[9]:.1f}%" if not np.isnan(r[9]) else "–",
-    f"{r[10]:.1f}" if not np.isnan(r[10]) else "–",
-    f"{r[11]:.2f}" if not np.isnan(r[11]) else "–"
+    f"{r[10]:.1f}%" if not np.isnan(r[10]) else "–",
+    f"{r[11]:.1f}" if not np.isnan(r[11]) else "–",
+    f"{r[12]:.2f}" if not np.isnan(r[12]) else "–"
 ] for r in rows]
 
 tbl = ax_tbl.table(
@@ -314,5 +321,6 @@ st.download_button(
     f"{selected_pitcher.replace(' ','_')}_report.png",
     "image/png"
 )
+
 
 

@@ -1,3 +1,4 @@
+# imports
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,16 +11,12 @@ from datetime import datetime
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
-# -----------------------------
-# Page setup
-# -----------------------------
+# page setup
 st.set_page_config(layout="wide", page_title="Pitching + Hitting Report Builder")
 st.title("⚾ Pitching + Hitting Report Builder")
 st.write("Upload CSV(s) → filter by date → pick ANY pitcher or hitter in the file.")
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# helper: pull the date out of a file name
 def extract_date(filename: str):
     match = re.search(r"(\d{1,2})[_-](\d{1,2})[_-](\d{2,4})", filename)
     if match:
@@ -32,6 +29,41 @@ def extract_date(filename: str):
             return None
     return None
 
+# helper: turn a file name into a Home vs Away date label
+def parse_matchup(filename: str) -> str:
+    base = re.sub(r"\s*\(\d+\)\s*", " ", str(filename))
+    base = re.sub(r"\.csv$", "", base, flags=re.I).strip()
+    dt = extract_date(base)
+    date_str = f"{dt.month}/{dt.day}/{dt:%y}" if dt else ""
+
+    m = re.search(r"[AP]M\s*-\s*(.+?)\s*@\s*(.+?)\s*$", base)
+    if m:
+        away = re.sub(r"\s*\[[^\]]*\]\s*$", "", m.group(1)).strip()
+        home = re.sub(r"\s*\[[^\]]*\]\s*$", "", m.group(2)).strip()
+        teams = [t for t in (away, home) if t and t.lower() != "null"]
+        if len(teams) == 2:
+            is_gu = lambda s: "georgetown" in s.lower() or s.lower() in ("gu", "gtown", "gu 2025", "gu 2026")
+            first, second = (home, away) if (is_gu(home) or not is_gu(away)) else (away, home)
+            return f"{first} vs {second} {date_str}".strip()
+
+    if date_str:
+        return f"Session {date_str}"
+    return base
+
+# helper: one label covering every uploaded file
+def matchup_label(source_files) -> str:
+    labels = sorted({parse_matchup(s) for s in source_files if pd.notna(s)})
+    if not labels:
+        return "session"
+    if len(labels) <= 3:
+        return " + ".join(labels)
+    return " + ".join(labels[:3]) + f" +{len(labels) - 3} more"
+
+# helper: make text safe for a file name
+def slugify(text: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "_", str(text)).strip("_") or "session"
+
+# helpers: small math and formatting utilities
 def safe_mean(series: pd.Series):
     s = pd.to_numeric(series, errors="coerce")
     return float(s.mean()) if s.notna().any() else np.nan
@@ -51,6 +83,7 @@ def require_cols(df: pd.DataFrame, cols: list[str], label: str = ""):
         st.error(f"Missing required columns {label}: {missing}")
         st.stop()
 
+# helper: flag any row that mentions a foul
 def add_foul_flag(df: pd.DataFrame) -> pd.DataFrame:
     obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
     if not obj_cols:
@@ -65,6 +98,7 @@ def add_foul_flag(df: pd.DataFrame) -> pd.DataFrame:
     df["RowHasFoul"] = combined.str.contains(r"\bfoul\b", case=False, regex=True)
     return df
 
+# helper: flag pitches inside the strike zone
 def add_zone_flags(df: pd.DataFrame) -> pd.DataFrame:
     margin_in = 2.85
     margin_ft = margin_in / 12
@@ -76,16 +110,8 @@ def add_zone_flags(df: pd.DataFrame) -> pd.DataFrame:
     df["ZoneLocKnown"] = px.notna() & pz.notna()
     return df
 
+# helper: label each ball in play as GB, LD, or FB
 def add_batted_ball_flags(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Priority:
-      1. HitType column, recognised value → use directly
-         GroundBall→GB, LineDrive→LD, FlyBall/Popup→FB, Throwdown→excluded
-      2. No HitType → fall back to launch angle (non-foul BIP with ExitSpeed)
-         GB: -90–10°, LD: 10–25°, FB: 25–90°
-      3. Neither → not a valid BIP
-    IsBIP = GB | LD | FB
-    """
     HT_GB    = {"GroundBall"}
     HT_LD    = {"LineDrive"}
     HT_FB    = {"FlyBall", "Popup"}
@@ -118,15 +144,8 @@ def add_batted_ball_flags(df: pd.DataFrame) -> pd.DataFrame:
     df["IsBIP"] = df["GB"] | df["LD"] | df["FB"]
     return df
 
+# helper: point switch hitters to the side they bat from
 def resolve_batter_side(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds BatterSideResolved column. Switch hitters are remapped to the
-    handedness they actually bat from against this pitcher:
-        Switch vs RHP  →  Left   (switch hitter bats left vs righty)
-        Switch vs LHP  →  Right  (switch hitter bats right vs lefty)
-    Non-switch batters keep their original BatterSide value.
-    Rows missing BatterSide or PitcherThrows are left as NaN.
-    """
     if "BatterSide" not in df.columns:
         df["BatterSideResolved"] = np.nan
         return df
@@ -140,16 +159,17 @@ def resolve_batter_side(df: pd.DataFrame) -> pd.DataFrame:
             return np.nan
         if side != "Switch":
             return side
-        # Switch hitter: bat opposite of pitcher's arm
+
         if throws == "Right":
             return "Left"
         if throws == "Left":
             return "Right"
-        return np.nan   # PitcherThrows unknown — can't resolve
+        return np.nan
 
     df["BatterSideResolved"] = df.apply(_resolve, axis=1)
     return df
 
+# helper: shrink a table font until it fits
 def fit_table_fontsize(table, ax, min_fontsize=6, start_fontsize=9):
     fig      = ax.get_figure()
     renderer = fig.canvas.get_renderer()
@@ -169,9 +189,7 @@ def fit_table_fontsize(table, ax, min_fontsize=6, start_fontsize=9):
         fontsize -= 0.5
     return fontsize
 
-# -----------------------------
-# Upload
-# -----------------------------
+# upload one or more CSVs
 uploaded_files = st.file_uploader(
     "Upload one or more CSV files",
     type=["csv"],
@@ -184,13 +202,13 @@ if not uploaded_files:
 df_list    = []
 file_dates = []
 
+# read each file and tag it with its name and date
 for f in uploaded_files:
     temp = pd.read_csv(f)
     session_date = extract_date(f.name)
     temp["SourceFile"]  = f.name
     temp["SessionDate"] = session_date
-    # Normalise name columns to prevent duplicate entries from whitespace.
-    # Cast to string first so .str accessor never raises on mixed/numeric dtypes.
+
     for col in ["Pitcher", "Batter"]:
         if col in temp.columns:
             temp[col] = (
@@ -198,7 +216,7 @@ for f in uploaded_files:
                 .astype(str)
                 .str.strip()
                 .str.replace(r"\s+", " ", regex=True)
-                .replace("nan", np.nan)   # restore genuine NaNs cast to "nan"
+                .replace("nan", np.nan)
             )
     df_list.append(temp)
     file_dates.append(session_date)
@@ -206,6 +224,7 @@ for f in uploaded_files:
 df = pd.concat(df_list, ignore_index=True)
 st.success(f"Loaded {len(uploaded_files)} file(s) with {len(df):,} total rows.")
 
+# stop early if a required column is missing
 needed = [
     "Pitcher", "Batter",
     "TaggedPitchType", "PitchCall", "PitchNo",
@@ -215,20 +234,20 @@ needed = [
 ]
 require_cols(df, needed, label="for this app")
 
+# add every derived column the app needs
 df = add_foul_flag(df)
 df = add_zone_flags(df)
 df = add_batted_ball_flags(df)
-df = resolve_batter_side(df)   # Switch hitters remapped here globally
+df = resolve_batter_side(df)
 
-# -----------------------------
-# Date filter
-# -----------------------------
+# figure out the overall date range
 valid_dates  = [d for d in file_dates if d is not None]
 season_range = (
     f"{min(valid_dates):%Y-%m-%d} → {max(valid_dates):%Y-%m-%d}"
     if valid_dates else "Unknown Date Range"
 )
 
+# let the user filter by session date
 available_dates = sorted(df["SessionDate"].dropna().unique())
 if available_dates:
     selected_dates = st.multiselect(
@@ -240,14 +259,18 @@ if available_dates:
 else:
     st.info("No session dates detected in filenames; skipping date filter.")
 
-# -----------------------------
-# Tabs
-# -----------------------------
+# label used to tag and name the CSV exports
+game_label = st.text_input(
+    "Game / session label (tags every exported CSV and its filename):",
+    value=matchup_label(df["SourceFile"].dropna().unique()),
+    help="Auto-detected from the file name(s). Edit it if the opponent didn't come through."
+)
+label_slug = slugify(game_label)
+
+# two tabs: pitcher report and hitter dashboard
 tab_pitcher, tab_hitter = st.tabs(["🎯 Pitcher Report", "🏏 Hitter Dashboard"])
 
-# =========================================================
-# PITCHER REPORT
-# =========================================================
+# PITCHER REPORT TAB
 with tab_pitcher:
     st.subheader("Pitcher Report Generator (All Players)")
 
@@ -273,9 +296,6 @@ with tab_pitcher:
 
     all_pitch_types = p["TaggedPitchType"].dropna().unique().tolist()
 
-    # -------------------------------------------------------
-    # Pitch type filter
-    # -------------------------------------------------------
     st.markdown("**Select pitch types to include in the report:**")
     selected_pitch_types = st.multiselect(
         "Pitch types shown on plots and summary table:",
@@ -288,10 +308,12 @@ with tab_pitcher:
         st.warning("Please select at least one pitch type.")
         st.stop()
 
+    # keep only the selected pitch types
     p_plot = p[p["TaggedPitchType"].isin(selected_pitch_types)].copy()
     p_plot = p_plot.sort_values("PitchNo").reset_index(drop=True)
     p_plot["PitchNo"] = range(1, len(p_plot) + 1)
 
+    # numbers for the summary strip at the top of the report
     total_bip      = int(p_plot["IsBIP"].sum())
     overall_gb_pct = pct(int(p_plot["GB"].sum()), total_bip)
     overall_ld_pct = pct(int(p_plot["LD"].sum()), total_bip)
@@ -314,13 +336,11 @@ with tab_pitcher:
     palette     = sns.color_palette("husl", len(pitch_types)) if pitch_types else []
     colors      = dict(zip(pitch_types, palette))
 
-    # ------------------------------------------------------------------
-    # Build per-pitch-type summary rows (left table)
-    # ------------------------------------------------------------------
     for opt in ["SpinRate", "HorzApprAngle", "VertApprAngle"]:
         if opt not in p_plot.columns:
             p_plot[opt] = np.nan
 
+    # pitch type summary table (left table on the PNG)
     def summarize_pitch_type(sub):
         bip = int(sub["IsBIP"].sum())
         gb  = int(sub["GB"].sum())
@@ -368,12 +388,7 @@ with tab_pitcher:
             format_num(r[12], 1), format_num(r[13], 2),
         ])
 
-    # ------------------------------------------------------------------
-    # Build handedness split table (right table)
-    # Uses BatterSideResolved — switch hitters are already remapped to
-    # Left (vs RHP) or Right (vs LHP), so only "Right" and "Left" groups
-    # appear here. No "vs S" column will ever be generated.
-    # ------------------------------------------------------------------
+    # same stats split by batter handedness (right table on the PNG)
     hand_col_p = "BatterSideResolved"
     hands_present_p = []
     if hand_col_p in p_plot.columns:
@@ -439,13 +454,11 @@ with tab_pitcher:
         elif "Avg EV" in col:
             hand_df_p_fmt[col] = hand_df_p_fmt[col].map(
                 lambda x: "–" if pd.isna(x) else f"{x:.1f}")
-        else:  # GB/FB
+        else:
             hand_df_p_fmt[col] = hand_df_p_fmt[col].map(
                 lambda x: "–" if pd.isna(x) else f"{x:.2f}")
 
-    # ------------------------------------------------------------------
-    # Figure
-    # ------------------------------------------------------------------
+    # draw the pitcher report figure
     fig = plt.figure(figsize=(22, 17), dpi=150)
     gs = gridspec.GridSpec(
         7, 4,
@@ -585,6 +598,7 @@ with tab_pitcher:
 
     st.pyplot(fig)
 
+    # offer the figure as a PNG download
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", bbox_inches="tight")
     buffer.seek(0)
@@ -596,9 +610,53 @@ with tab_pitcher:
         "image/png"
     )
 
-# =========================================================
-# HITTER DASHBOARD
-# =========================================================
+    # build a CSV with exactly the numbers shown on the PNG
+    def _type_max_velo(pt):
+        v = pd.to_numeric(
+            p_plot.loc[p_plot["TaggedPitchType"] == pt, "RelSpeed"], errors="coerce"
+        )
+        return float(v.max()) if v.notna().any() else np.nan
+
+    report_df = pd.DataFrame(rows, columns=col_labels_left)
+    report_df.insert(0, "Pitch Type", row_labels)
+    report_df.insert(3, "Max Velo", [_type_max_velo(pt) for pt in row_labels])
+
+    hand_num = hand_df_p.copy()
+    hand_num.columns = [c.replace("\n", " ") for c in hand_num.columns]
+    report_df = report_df.merge(hand_num, on="Pitch Type", how="left")
+
+    overall_out = {c: np.nan for c in report_df.columns}
+    overall_out["Pitch Type"] = "Overall"
+    overall_out["Count"]    = total_pitches
+    overall_out["Max Velo"] = max_velo
+    overall_out["PZR%"]     = overall_pzr
+    overall_out["GB%"]      = overall_gb_pct
+    overall_out["LD%"]      = overall_ld_pct
+    overall_out["FB%"]      = overall_fb_pct
+    report_df = pd.concat([pd.DataFrame([overall_out]), report_df], ignore_index=True)
+
+    round_map = {
+        "Count": 0, "Velo": 1, "Max Velo": 1, "IVB": 1, "HB": 1, "Spin": 0,
+        "HAA": 2, "VAA": 2, "PZR%": 1, "CSW%": 1, "GB%": 1, "LD%": 1, "FB%": 1,
+        "Avg EV": 1, "GB/FB": 2,
+    }
+    for c in report_df.columns:
+        if c == "Pitch Type":
+            continue
+        d = round_map.get(c, 2 if c.endswith("GB/FB") else 1)
+        report_df[c] = pd.to_numeric(report_df[c], errors="coerce").round(d)
+    report_df["Count"] = report_df["Count"].astype("Int64")
+    report_df.insert(0, "Game", game_label)
+    report_df.insert(1, "Player", selected_pitcher)
+
+    st.download_button(
+        "Download Report Data (CSV)",
+        report_df.to_csv(index=False).encode("utf-8"),
+        f"{label_slug}_{slugify(selected_pitcher)}_pitching.csv",
+        "text/csv"
+    )
+
+# HITTER DASHBOARD TAB
 with tab_hitter:
     st.subheader("Hitter Whiff% + Exit Velocity (EV) + Chase% (All Players)")
 
@@ -621,6 +679,7 @@ with tab_hitter:
     h = h[h["TaggedPitchType"].notna()]
     h = h[h["PitchCall"].notna()]
 
+    # per pitch swing, whiff, chase, and contact flags
     h["IsSwing"]   = h["PitchCall"].isin(SWING_CALLS)
     h["IsWhiff"]   = h["PitchCall"].isin(WHIFF_CALLS)
     h["IsContact"] = h["PitchCall"].isin(CONTACT_CALLS)
@@ -630,6 +689,7 @@ with tab_hitter:
     h["IsZSwing"]   = h["IsSwing"]   & (h["ZoneLocKnown"]) & (h["InZone"])
     h["IsZContact"] = h["IsContact"] & (h["ZoneLocKnown"]) & (h["InZone"])
 
+    # overall hitter totals
     total_pitches   = len(h)
     total_swings    = int(h["IsSwing"].sum())
     total_whiffs    = int(h["IsWhiff"].sum())
@@ -647,6 +707,7 @@ with tab_hitter:
     avg_launch_angle = float(angle_all.mean())              if angle_all.notna().any()      else np.nan
     ev_90th          = float(exit_speed_all.quantile(0.90)) if exit_speed_all.notna().any() else np.nan
 
+    # KPI row at the top of the tab
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Overall Chase%",   format_pct(overall_chase))
     m2.metric("Z-Contact%",       format_pct(overall_z_contact))
@@ -661,6 +722,7 @@ with tab_hitter:
         "Zone matches pitcher report PZR. EV excludes any row tagged 'foul' anywhere in the row only for BIP-specific metrics."
     )
 
+    # per pitch type summary table
     def hitter_group_summary(g: pd.DataFrame):
         pitches   = len(g)
         swings    = int(g["IsSwing"].sum())
@@ -700,6 +762,7 @@ with tab_hitter:
     st.markdown("### By Pitch Type")
     st.dataframe(show_tbl, use_container_width=True)
 
+    # strike zone plot of notable pitches
     st.markdown("### Strike Zone Plot: Hard-Hit Swings (EV 90+), Chases, Whiffs, and Called Strikes")
 
     show_called_strikes = st.checkbox(
@@ -712,6 +775,7 @@ with tab_hitter:
     palette_h    = sns.color_palette("husl", len(hitter_pitch_types)) if hitter_pitch_types else []
     pitch_colors = dict(zip(hitter_pitch_types, palette_h))
 
+    # tag each pitch with one plot event
     h["IsHardHit90"]        = h["IsSwing"] & h["IsBIP"] & (pd.to_numeric(h["ExitSpeed"], errors="coerce") >= 90)
     h["IsCalledStrikeZone"] = h["ZoneLocKnown"] & h["InZone"] & (~h["IsSwing"])
     h["IsWhiffChase"]       = h["IsWhiff"] & h["IsChase"]
@@ -726,6 +790,7 @@ with tab_hitter:
 
     plot_df = h[h["PlotEvent"].notna()].copy()
 
+    # assemble the overall and per pitch type table
     overall_row = pd.DataFrame([{
         "Pitch Type":  "Overall",
         "Pitches":     total_pitches,
@@ -751,6 +816,7 @@ with tab_hitter:
             summary_for_png[c] = np.nan
     summary_for_png = summary_for_png[desired_cols].copy()
 
+    # split by pitcher handedness
     hand_col_h    = "PitcherThrows"
     hands_in_data = []
     if hand_col_h in h.columns:
@@ -805,6 +871,7 @@ with tab_hitter:
             hand_df_h_fmt[col] = hand_df_h_fmt[col].map(
                 lambda x: "–" if pd.isna(x) else f"{x:.1f}")
 
+    # draw the hitter figure
     fig_combo = plt.figure(figsize=(14.0, 13.5), dpi=170)
     gs_combo  = gridspec.GridSpec(5, 1, height_ratios=[0.6, 0.95, 3.8, 0.20, 2.6], hspace=0.30)
 
@@ -940,6 +1007,7 @@ with tab_hitter:
 
     st.pyplot(fig_combo)
 
+    # offer the figure as a PNG download
     combo_buf = io.BytesIO()
     fig_combo.savefig(combo_buf, format="png", bbox_inches="tight")
     combo_buf.seek(0)
@@ -951,18 +1019,26 @@ with tab_hitter:
         mime="image/png"
     )
 
+    # build a CSV with exactly the numbers shown on the PNG
     st.markdown("### Download")
-    out = by_pitch.copy()
-    out["Whiff%"]     = out["Whiff%"].round(3)
-    out["Chase%"]     = out["Chase%"].round(3)
-    out["Z-Contact%"] = out["Z-Contact%"].round(3)
-    out["Avg EV"]     = out["Avg EV"].round(3)
-    out["Avg LA"]     = out["Avg LA"].round(3)
-    csv_bytes = out.to_csv(index=False).encode("utf-8")
+    hitter_report = summary_for_png.merge(
+        hand_df_h.rename(columns=lambda c: c.replace("\n", " ")),
+        on="Pitch Type", how="left"
+    )
+    for c in hitter_report.columns:
+        if c == "Pitch Type":
+            continue
+        if c in ("Pitches", "Swings", "Whiffs", "Chases", "BIP"):
+            hitter_report[c] = pd.to_numeric(hitter_report[c], errors="coerce").astype("Int64")
+        else:
+            hitter_report[c] = pd.to_numeric(hitter_report[c], errors="coerce").round(1)
+    hitter_report.insert(0, "Game", game_label)
+    hitter_report.insert(1, "Player", selected_hitter)
 
     st.download_button(
-        "Download Hitter Summary (CSV)",
-        data=csv_bytes,
-        file_name=f"{selected_hitter.replace(' ', '_')}_hitter_summary.csv",
+        "Download Report Data (CSV)",
+        data=hitter_report.to_csv(index=False).encode("utf-8"),
+        file_name=f"{label_slug}_{slugify(selected_hitter)}_hitting.csv",
         mime="text/csv"
     )
+

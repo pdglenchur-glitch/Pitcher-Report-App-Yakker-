@@ -1,4 +1,3 @@
-# imports
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,6 +6,7 @@ import matplotlib.gridspec as gridspec
 import seaborn as sns
 import io
 import re
+import difflib
 from datetime import datetime
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
@@ -18,7 +18,7 @@ st.write("Upload CSV(s) → filter by date → pick ANY pitcher or hitter in the
 
 # helper: pull the date out of a file name
 def extract_date(filename: str):
-    match = re.search(r"(\d{1,2})[_-](\d{1,2})[_-](\d{2,4})", filename)
+    match = re.search(r"(\d{1,2})[_.-](\d{1,2})[_.-](\d{2,4})", filename)
     if match:
         month, day, year = match.groups()
         if len(year) == 2:
@@ -32,7 +32,7 @@ def extract_date(filename: str):
 # helper: turn a file name into a Home vs Away date label
 def parse_matchup(filename: str) -> str:
     base = re.sub(r"\s*\(\d+\)\s*", " ", str(filename))
-    base = re.sub(r"\.csv$", "", base, flags=re.I).strip()
+    base = re.sub(r"\.(csv|xlsx)$", "", base, flags=re.I).strip()
     dt = extract_date(base)
     date_str = f"{dt.month}/{dt.day}/{dt:%y}" if dt else ""
 
@@ -45,6 +45,10 @@ def parse_matchup(filename: str) -> str:
             is_gu = lambda s: "georgetown" in s.lower() or s.lower() in ("gu", "gtown", "gu 2025", "gu 2026")
             first, second = (home, away) if (is_gu(home) or not is_gu(away)) else (away, home)
             return f"{first} vs {second} {date_str}".strip()
+
+    # TrackMan report workbooks are already named like "UVA vs Georgetown - 9.27.26 ..."
+    if re.search(r"\bvs\.?\s", base, flags=re.I):
+        return base
 
     if date_str:
         return f"Session {date_str}"
@@ -85,7 +89,7 @@ def require_cols(df: pd.DataFrame, cols: list[str], label: str = ""):
 
 # helper: flag any row that mentions a foul
 def add_foul_flag(df: pd.DataFrame) -> pd.DataFrame:
-    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    obj_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
     if not obj_cols:
         df["RowHasFoul"] = False
         return df
@@ -169,6 +173,362 @@ def resolve_batter_side(df: pd.DataFrame) -> pd.DataFrame:
     df["BatterSideResolved"] = df.apply(_resolve, axis=1)
     return df
 
+# helper: read one upload and say which platform it came from
+# .xlsx = TrackMan report workbook (Raw Data tab); .csv with yt_ columns = YakkerTech; other .csv = TrackMan export
+def read_upload(f):
+    if f.name.lower().endswith(".xlsx"):
+        xl = pd.ExcelFile(f)
+        if "Raw Data" not in xl.sheet_names:
+            raise ValueError(f"{f.name}: no 'Raw Data' tab found, so it was skipped.")
+        return pd.read_excel(xl, sheet_name="Raw Data"), "TrackMan"
+    temp = pd.read_csv(f, low_memory=False)
+    source = "YakkerTech" if any(str(c).startswith("yt_") for c in temp.columns) else "TrackMan"
+    return temp, source
+
+# helper: fall back to the Date column when the file name has no date
+def date_from_column(temp: pd.DataFrame):
+    if "Date" not in temp.columns:
+        return None
+    dates = pd.to_datetime(temp["Date"], errors="coerce").dropna()
+    return dates.mode().iloc[0].to_pydatetime() if not dates.empty else None
+
+# helper: "Pauley, Gibson" -> "Gibson Pauley", "Burnett," -> "Burnett"
+def flip_name(name):
+    if pd.isna(name) or "," not in str(name):
+        return name
+    last, first = [s.strip() for s in str(name).split(",", 1)]
+    return f"{first} {last}".strip()
+
+# TrackMan report columns computed with their own definitions (different zone, 95 mph hard-hit, etc.)
+# The app recomputes all of these itself, so they're dropped to keep both platforms on one definition.
+TM_HELPER_COLS = re.compile(r"^(Is[A-Z]\w*|InZone|CountsAsPA|TotalBases|PAKey)$|_Clean$")
+
+TM_PITCH_TYPES = {
+    "ChangeUp": "Changeup",
+    "FourSeamFastBall": "Fastball",
+    "Four-Seam": "Fastball",
+    "TwoSeamFastBall": "Sinker",
+}
+
+# helper: put TrackMan column names and values into the YakkerTech format the app uses
+def normalize_trackman(temp: pd.DataFrame) -> pd.DataFrame:
+    temp = temp.drop(columns=[c for c in temp.columns if TM_HELPER_COLS.search(str(c))])
+    obj_cols = temp.select_dtypes(include=["object", "string"]).columns
+    temp[obj_cols] = temp[obj_cols].replace("Undefined", np.nan)
+    for old, new in {"TaggedHitType": "HitType", "Half": "Top/Bottom"}.items():
+        if old in temp.columns and new not in temp.columns:
+            temp = temp.rename(columns={old: new})
+    if "TaggedPitchType" in temp.columns:
+        temp["TaggedPitchType"] = temp["TaggedPitchType"].replace(TM_PITCH_TYPES)
+    return temp
+
+# helper: one pitch-call vocabulary for every platform
+# FoulBallNotFieldable / FoulBallFieldable / FoulTip -> Foul, BallinDirt / BallIntentional -> BallCalled
+def normalize_pitch_calls(temp: pd.DataFrame) -> pd.DataFrame:
+    if "PitchCall" in temp.columns:
+        call = temp["PitchCall"].astype(str)
+        temp["PitchCall"] = (
+            temp["PitchCall"]
+            .mask(call.str.startswith("Foul"), "Foul")
+            .mask(call.str.startswith("Ball"), "BallCalled")
+        )
+    return temp
+
+# readings outside these ranges are tracking dropouts (e.g. a 45 mph "fastball"),
+# treated as missing on every platform
+PLAUSIBLE_RANGES = {"RelSpeed": (60, 105), "Extension": (0, 10)}
+
+def screen_outliers(df: pd.DataFrame):
+    n_screened = 0
+    for col, (lo, hi) in PLAUSIBLE_RANGES.items():
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce")
+        bad  = vals.notna() & ((vals < lo) | (vals > hi))
+        n_screened += int(bad.sum())
+        df[col] = vals.mask(bad)
+    return df, n_screened
+
+# helper: label which platform(s) a slice of data came from
+def platform_label(frame: pd.DataFrame) -> str:
+    sources = sorted(frame["Source"].dropna().unique()) if "Source" in frame.columns else []
+    return " + ".join(sources) if sources else "–"
+
+# Georgetown players, so last-name-only TrackMan entries can be matched even when no
+# YakkerTech file is uploaded. Built from the 2027 fall YakkerTech CSVs (team labels
+# Fall2026PracticeGT / Gtown fall2024 roster / Georgetown). Add new players here as "First Last".
+GU_ROSTER = [
+    "Addison Lee", "Amman Dewberry", "Andrew Jergins", "Ashton Arroyo", "Ashton Seymore",
+    "Brady Holland", "Brandon Davis", "Braxton Templin", "Charlie Hendrix", "Christian Hamilton",
+    "Collin Sullivan", "Connor Peek", "Dan Ockerman", "Davis Hanson", "Dixon Monk",
+    "Dom Cafferillo", "Drew Rybinski", "Dylan Larkins", "Gibson Pauley", "J.w. Riggins",
+    "Jack Volo", "Jordan Kahn", "Julius Pfau", "Kavi Caster", "Khalon Davis",
+    "Luke Jackman", "Matthew Sapienza", "Max Andrews", "Max Whitmer", "Mike Poncini",
+    "Nelson Hayes", "Roman Tozzi", "Rowin O'connor", "Sebastian Burnett", "Shane Keup",
+    "Simon Tesfaye", "Travis Ilitch",
+]
+
+# team labels Georgetown shows up under (TrackMan code GEO_HOY; YakkerTech practice/roster names).
+# Deliberately not plain "geo": George Mason (geo01) and GW (geo02) would match.
+GU_TEAM_PATTERN = r"GEO_HOY|georgetown|gtown|practicegt|^gu\b"
+
+ROLE_TEAM_COLS = [("Pitcher", "PitcherTeam"), ("Batter", "BatterTeam")]
+
+def is_gu_team(team: pd.Series) -> pd.Series:
+    return team.astype(str).str.contains(GU_TEAM_PATTERN, case=False, regex=True)
+
+# helper: is this file a Georgetown intrasquad (GU is both the home and away team)?
+def is_intrasquad(g: pd.DataFrame, src_file: str) -> bool:
+    if "HomeTeam" in g.columns and "AwayTeam" in g.columns:
+        home, away = g["HomeTeam"].dropna(), g["AwayTeam"].dropna()
+        if not home.empty and not away.empty:
+            return bool(is_gu_team(home).any() and is_gu_team(away).any())
+    m = re.search(r"[AP]M\s*-\s*(.+?)\s*@\s*(.+?)\s*(\(\d+\))?\.\w+$", str(src_file))
+    return bool(m) and all(re.search(GU_TEAM_PATTERN, t, flags=re.I) for t in m.group(1, 2))
+
+# helper: which pitcher rows / batter rows belong to Georgetown players.
+# Player team labels are unreliable (YakkerTech sometimes attaches the wrong team profile, e.g. a GU
+# hitter tagged "Augusta", or an old school's profile), so in order:
+#   1. GU intrasquad file              -> every pitcher and batter is GU
+#   2. GU's batting half can be told   -> batters in that half and pitchers in the other half are GU,
+#      decided per player by majority (from where most GU-labeled hitters bat). This is the only thing
+#      that overrides the Georgetown list, so an opponent who shares a GU player's name stays out.
+#   3. otherwise                       -> GU if the player is on the Georgetown list (roster + anyone
+#      rule 1 or 2 confirmed as GU anywhere in the upload), whatever their team label says; players
+#      not on the list go by the team label (unlabeled rows count if they're GU-labeled elsewhere)
+def gu_row_masks(df: pd.DataFrame):
+    labeled, label_names = {}, set()
+    for col, team_col in ROLE_TEAM_COLS:
+        team = df[team_col] if team_col in df.columns else pd.Series(np.nan, index=df.index)
+        labeled[col] = is_gu_team(team)
+        label_names |= set(df.loc[labeled[col], col].dropna())
+
+    # rules 1 and 2: True / False where the game itself shows the side, NaN where it can't
+    decided = {col: pd.Series(np.nan, index=df.index, dtype=object) for col, _ in ROLE_TEAM_COLS}
+    half = df["Top/Bottom"] if "Top/Bottom" in df.columns else pd.Series(np.nan, index=df.index)
+    for src_file, idx in df.groupby("SourceFile").groups.items():
+        g = df.loc[idx]
+        if is_intrasquad(g, src_file):
+            for col, _ in ROLE_TEAM_COLS:
+                named = g.index[g[col].notna()]
+                decided[col].loc[named] = True
+            continue
+        h = half[idx]
+        gu_halves = h[labeled["Batter"][idx] & h.notna()]
+        if len(gu_halves) < 5:
+            continue
+        top_share = float((gu_halves == "Top").mean())
+        if 0.25 < top_share < 0.75:
+            continue
+        gu_bat_half = "Top" if top_share >= 0.75 else "Bottom"
+        # decide per player by majority, since a stray pitch can be stamped with the wrong half
+        known = idx[h.notna()]
+        for col, gu_side in [("Batter", True), ("Pitcher", False)]:
+            in_gu_half = (half[known] == gu_bat_half) == gu_side
+            share  = in_gu_half.groupby(df.loc[known, col]).mean()
+            vote   = g[col].map(share)
+            decide = vote.index[vote.notna()]
+            decided[col].loc[decide] = (vote[decide] >= 0.5).values
+
+    # the Georgetown list: roster + everyone the games themselves confirmed as GU
+    gu_list = set(GU_ROSTER)
+    for col, _ in ROLE_TEAM_COLS:
+        gu_list |= set(df.loc[decided[col].eq(True), col].dropna())
+
+    masks = []
+    for col, team_col in ROLE_TEAM_COLS:
+        team = df[team_col] if team_col in df.columns else pd.Series(np.nan, index=df.index)
+        fallback = labeled[col] | df[col].isin(gu_list) | (team.isna() & df[col].isin(label_names))
+        masks.append(decided[col].where(decided[col].notna(), fallback).astype(bool))
+    return masks[0], masks[1]
+
+# helper: one comparable key per team ("GU" for every Georgetown label, opponents without the [code])
+def team_key(team) -> str:
+    t = str(team)
+    if re.search(GU_TEAM_PATTERN, t, flags=re.I):
+        return "GU"
+    return re.sub(r"\s*\[.*$", "", t).strip().lower()
+
+# helper: when one short name has more than one player ID in the same file (raw TrackMan
+# exports carry BatterId / PitcherId), tag each as "Davis [ID 1234]" so they match separately
+ID_TAG = re.compile(r" \[ID [^\]]*\]$")
+
+def base_name(name: str) -> str:
+    return ID_TAG.sub("", str(name))
+
+def split_by_ids(df: pd.DataFrame) -> pd.DataFrame:
+    for col, id_col in [("Pitcher", "PitcherId"), ("Batter", "BatterId")]:
+        if id_col not in df.columns:
+            continue
+        short = df[col].notna() & ~df[col].astype(str).str.contains(" ") & df[id_col].notna()
+        sub   = df[short]
+        if sub.empty:
+            continue
+        n_ids = sub.groupby(["SourceFile", col])[id_col].transform("nunique")
+        idx   = sub.index[n_ids > 1]
+        ids   = df.loc[idx, id_col].map(lambda v: str(int(v)) if isinstance(v, float) and v.is_integer() else str(v))
+        df.loc[idx, col] = df.loc[idx, col] + " [ID " + ids + "]"
+    return df
+
+# helper: one entry per plate appearance (batters) or per inning (pitchers) for a name in one
+# file, so two players sharing a short name in the same game can be split by hand
+def split_units(g: pd.DataFrame, col: str, name: str):
+    rows = g[g[col] == name].sort_values("PitchNo")
+    keys = ["Inning", "Top/Bottom", "PAofInning"] if col == "Batter" else ["Inning", "Top/Bottom"]
+    keys = [k for k in keys if k in rows.columns] or ["PitchNo"]
+
+    def _fmt(v):
+        return "?" if pd.isna(v) else (str(int(v)) if isinstance(v, (int, float)) and float(v).is_integer() else str(v))
+
+    units = []
+    for key, u in rows.groupby(keys, dropna=False, sort=False):
+        parts = dict(zip(keys, key if isinstance(key, tuple) else (key,)))
+        label = f"Inning {_fmt(parts.get('Inning'))}"
+        if pd.notna(parts.get("Top/Bottom")):
+            label += f" ({parts['Top/Bottom']})"
+        if col == "Batter":
+            if "PAofInning" in parts:
+                label += f" · PA {_fmt(parts['PAofInning'])}"
+            label += f" · vs {', '.join(u['Pitcher'].dropna().unique()) or '?'}"
+            last = u.iloc[-1]
+            result = next((last[c] for c in ["PlayResult", "KorBB", "PitchCall"]
+                           if c in u.columns and pd.notna(last[c])), None)
+            if result is not None:
+                label += f" · {result}"
+        else:
+            label += f" · {len(u)} pitches · {u['Batter'].nunique()} batters"
+        units.append((str(key), label, u.index))
+    return units
+
+# helper: table of names to review, one row per game file + name, since the same short
+# name ("Davis") can be a different player in different games
+KEEP_NAME  = "(keep as is)"
+SPLIT_NAME = "More than one player…"
+NAME_TABLE_COLS = ["File", "Name in file", "Role", "Reason", "Platform", "Match to"]
+
+# helper: two full names that are probably one player, e.g. a nickname ("Dom" / "Dominick
+# Cafferillo") or a tagging typo ("Drew Raybinski" / "Drew Rybinski")
+def similar_names(a: str, b: str) -> bool:
+    a_l, b_l = a.lower(), b.lower()
+    if a_l == b_l:
+        return False
+    fa, la = a_l.split()[0], a_l.split()[-1]
+    fb, lb = b_l.split()[0], b_l.split()[-1]
+    if la == lb and fa != fb and min(len(fa), len(fb)) >= 2 and (fa.startswith(fb) or fb.startswith(fa)):
+        return True
+    # same first name, misspelled last name ("Drew Raybinish" / "Drew Rybinski")
+    if fa == fb and la != lb and difflib.SequenceMatcher(None, la, lb).ratio() >= 0.75:
+        return True
+    sm = difflib.SequenceMatcher(None, a_l, b_l)
+    return sm.real_quick_ratio() >= 0.88 and sm.quick_ratio() >= 0.88 and sm.ratio() >= 0.88
+
+# helper: map each "possible duplicate" full name to the spelling it should merge into.
+# Only names that share a team are compared, so two different players on different teams never pair up.
+# The roster spelling wins, then the more common spelling in the upload, then alphabetical.
+def find_duplicate_targets(full: list, name_teams: dict, name_counts: pd.Series) -> dict:
+    def rank(x):
+        return (x in GU_ROSTER, int(name_counts.get(x, 0)), [-ord(c) for c in x])
+
+    by_team = {}
+    for n in full:
+        for t in (name_teams.get(n) or {"?"}):
+            by_team.setdefault(t, []).append(n)
+
+    # group chains of similar spellings ("Raybinish" ~ "Raybinski" ~ "Rybinski") into one cluster
+    parent = {}
+    def root(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for group in by_team.values():
+        for i, a in enumerate(group):
+            for b in group[i + 1:]:
+                if similar_names(a, b):
+                    parent[root(a)] = root(b)
+
+    clusters = {}
+    for n in parent:
+        clusters.setdefault(root(n), []).append(n)
+    targets = {}
+    for members in clusters.values():
+        best = max(members, key=rank)
+        targets.update({m: best for m in members if m != best})
+    return targets
+
+def build_name_table(df: pd.DataFrame, show_all_file=None, gu_only: bool = False):
+    upload_full = {
+        n for col in ["Pitcher", "Batter"] for n in df[col].dropna().unique() if " " in base_name(n)
+    }
+    full_names  = sorted(upload_full | set(GU_ROSTER))
+
+    # every team each name shows up for, and how often it appears
+    name_teams = {n: {"GU"} for n in GU_ROSTER}
+    for col, team_col in ROLE_TEAM_COLS:
+        if team_col in df.columns:
+            pairs = df[[col, team_col]].dropna().drop_duplicates()
+            for n, t in zip(pairs[col], pairs[team_col]):
+                name_teams.setdefault(n, set()).add(team_key(t))
+    name_counts = pd.concat([df["Pitcher"], df["Batter"]]).value_counts()
+    dup_target  = find_duplicate_targets(full_names, name_teams, name_counts)
+
+    gu_pitch, gu_bat = gu_row_masks(df)
+
+    rows = []
+    for src_file, g in df.groupby("SourceFile", sort=False):
+        roles = {}
+        for col, _ in ROLE_TEAM_COLS:
+            for n in g[col].dropna().unique():
+                roles.setdefault(n, set()).add(col)
+        gu_names = set(g.loc[gu_pitch[g.index], "Pitcher"].dropna()) | set(g.loc[gu_bat[g.index], "Batter"].dropna())
+
+        for n in sorted(roles):
+            if gu_only and n not in gu_names:
+                continue
+            last_only = " " not in base_name(n)
+            id_split  = n != base_name(n)
+            # roster names are only suggested for players on a Georgetown team row
+            candidates = (upload_full | set(GU_ROSTER)) if n in gu_names else upload_full
+            # same name with different capitalization, e.g. "J.W. Riggins" vs "J.w. Riggins"
+            # (roster spelling wins; otherwise the alphabetically first, so two names never swap)
+            recased = [
+                m for m in candidates
+                if m != n and m.lower() == n.lower()
+                and (m in GU_ROSTER or (n not in GU_ROSTER and m < n))
+            ]
+            dup_of = dup_target.get(n) if not (last_only or id_split) else None
+            if not (last_only or recased or dup_of or src_file == show_all_file):
+                continue
+            last = base_name(n).split()[-1].lower()
+            # collapse nickname/typo variants first, so "Cafferillo" sees one player, not two spellings
+            same_last = {
+                dup_target.get(m, m) for m in candidates
+                if m != n and m.split()[-1].lower() == last
+            }
+            if recased:
+                suggestion, reason = dup_target.get(recased[0], recased[0]), "capitalization"
+            elif id_split:
+                # two IDs share this name, so a single suggestion would merge them back together
+                suggestion, reason = KEEP_NAME, "two player IDs"
+            elif dup_of:
+                suggestion, reason = dup_of, "possible same player"
+            elif last_only:
+                suggestion = next(iter(same_last)) if len(same_last) == 1 else KEEP_NAME
+                reason     = "last name only"
+            else:
+                suggestion, reason = KEEP_NAME, ""
+            rows.append({
+                "File":         src_file,
+                "Name in file": n,
+                "Role":         " / ".join(sorted(roles[n])),
+                "Reason":       reason,
+                "Platform":     g["Source"].iat[0],
+                "Match to":     suggestion,
+            })
+    return pd.DataFrame(rows, columns=NAME_TABLE_COLS), full_names
+
 # helper: shrink a table font until it fits
 def fit_table_fontsize(table, ax, min_fontsize=6, start_fontsize=9):
     fig      = ax.get_figure()
@@ -189,25 +549,36 @@ def fit_table_fontsize(table, ax, min_fontsize=6, start_fontsize=9):
         fontsize -= 0.5
     return fontsize
 
-# upload one or more CSVs
+# upload one or more YakkerTech / TrackMan files
 uploaded_files = st.file_uploader(
-    "Upload one or more CSV files",
-    type=["csv"],
+    "Upload one or more files (YakkerTech CSV, TrackMan CSV, or TrackMan report .xlsx with a 'Raw Data' tab)",
+    type=["csv", "xlsx"],
     accept_multiple_files=True
 )
 
 if not uploaded_files:
     st.stop()
 
-df_list    = []
-file_dates = []
+df_list      = []
+file_dates   = []
+file_sources = []
 
-# read each file and tag it with its name and date
+# read each file and tag it with its name, date, and platform
 for f in uploaded_files:
-    temp = pd.read_csv(f)
-    session_date = extract_date(f.name)
+    try:
+        temp, source = read_upload(f)
+    except ValueError as e:
+        st.warning(str(e))
+        continue
+
+    if source == "TrackMan":
+        temp = normalize_trackman(temp)
+    temp = normalize_pitch_calls(temp)
+
+    session_date = extract_date(f.name) or date_from_column(temp)
     temp["SourceFile"]  = f.name
     temp["SessionDate"] = session_date
+    temp["Source"]      = source
 
     for col in ["Pitcher", "Batter"]:
         if col in temp.columns:
@@ -217,12 +588,22 @@ for f in uploaded_files:
                 .str.strip()
                 .str.replace(r"\s+", " ", regex=True)
                 .replace("nan", np.nan)
+                .map(flip_name)
             )
     df_list.append(temp)
     file_dates.append(session_date)
+    file_sources.append(source)
+
+if not df_list:
+    st.stop()
 
 df = pd.concat(df_list, ignore_index=True)
-st.success(f"Loaded {len(uploaded_files)} file(s) with {len(df):,} total rows.")
+source_counts = pd.Series(file_sources).value_counts()
+st.success(
+    f"Loaded {len(df_list)} file(s) "
+    f"({', '.join(f'{n} {s}' for s, n in source_counts.items())}) "
+    f"with {len(df):,} total rows."
+)
 
 # stop early if a required column is missing
 needed = [
@@ -233,6 +614,108 @@ needed = [
     "ExitSpeed", "Angle"
 ]
 require_cols(df, needed, label="for this app")
+
+# match last-name-only entries (common in TrackMan files) to full names found in the uploads
+# Georgetown-only mode: limits name matching and the pitcher / hitter lists to GU players, so an
+# opponent who shares a name with a GU player (or with another opponent) is never pooled in
+gu_only = st.toggle(
+    "Georgetown players only",
+    value=False,
+    help="Only review Georgetown names below, and only list Georgetown pitchers / hitters (using "
+         "their Georgetown rows) in the report tabs. Opponents with the same name are left out."
+)
+
+df = split_by_ids(df)
+names_preview, _ = build_name_table(df, gu_only=gu_only)
+
+st.markdown(
+    f"#### Name matching ({len(names_preview)} name(s) to review across "
+    f"{names_preview['File'].nunique()} game file(s))"
+)
+st.caption(
+    "Some files tag players by last name only (e.g. \"Burnett,\"). Open a game below and pick the full "
+    "name each one should count as; the two are merged into one player everywhere in the app. Matches "
+    "are set per game file, so the same short name can point to different players in different games. "
+    "If two players share a name in the same game, pick \"More than one player…\" and assign each "
+    "plate appearance (or inning, for pitchers). Click a box and type to search. Suggestions come "
+    "from the Georgetown roster and full names found in the uploaded files."
+)
+show_all_file = None
+if st.checkbox("Show every name in one game file (to merge any two spellings)", value=False):
+    show_all_file = st.selectbox(
+        "Game file:",
+        list(df["SourceFile"].dropna().unique()),
+        format_func=lambda s: f"{parse_matchup(s)}  ({s})",
+    )
+names_tbl, full_names = build_name_table(df, show_all_file, gu_only=gu_only)
+
+name_map     = {}   # {game file: {name in file: full name}}
+split_assign = []   # [(row index, column, full name)] for names split by plate appearance / inning
+if names_tbl.empty:
+    st.caption("Nothing to review.")
+
+for src_file, file_rows in names_tbl.groupby("File", sort=False):
+    # label is built from the suggestions only, so it doesn't change (and collapse) as picks are made
+    n_open = int((file_rows["Match to"] == KEEP_NAME).sum())
+    status = f"{n_open} without a suggestion" if n_open else "all suggested"
+    with st.expander(
+        f"{parse_matchup(src_file)} · {file_rows['Platform'].iat[0]} · "
+        f"{len(file_rows)} name(s), {status}"
+    ):
+        st.caption(src_file)
+        g = df[df["SourceFile"] == src_file]
+        for _, r in file_rows.iterrows():
+            name = r["Name in file"]
+            options = [KEEP_NAME, SPLIT_NAME] + [n for n in full_names if n != name]
+            c1, c2, c3 = st.columns([2, 2, 3])
+            c1.write(name)
+            c2.caption(f"{r['Role']} · {r['Reason']}" if r["Reason"] else r["Role"])
+            choice = c3.selectbox(
+                f"Same player as {name} in {src_file}",
+                options,
+                index=options.index(r["Match to"]) if r["Match to"] in options else 0,
+                key=f"name_map::{src_file}::{name}",
+                label_visibility="collapsed",
+            )
+            if choice == SPLIT_NAME:
+                unit_options = [KEEP_NAME] + [n for n in full_names if n != name]
+                for role in r["Role"].split(" / "):
+                    for unit_key, unit_label, idx in split_units(g, role, name):
+                        s1, s2 = st.columns([4, 3])
+                        s1.caption(f"↳ {role}: {unit_label}")
+                        pick = s2.selectbox(
+                            f"{name} {role} {unit_label}",
+                            unit_options,
+                            key=f"split::{src_file}::{role}::{name}::{unit_key}",
+                            label_visibility="collapsed",
+                        )
+                        if pick != KEEP_NAME:
+                            split_assign.append((idx, role, pick))
+            elif choice != KEEP_NAME:
+                name_map.setdefault(src_file, {})[name] = choice
+
+n_merges = sum(len(m) for m in name_map.values())
+if n_merges or split_assign:
+    st.success(
+        f"{n_merges} name merge(s) applied across {len(name_map)} game file(s)"
+        + (f", plus {len(split_assign)} split assignment(s)." if split_assign else ".")
+    )
+
+for src_file, file_map in name_map.items():
+    in_file = df["SourceFile"] == src_file
+    for col in ["Pitcher", "Batter"]:
+        df.loc[in_file, col] = df.loc[in_file, col].replace(file_map)
+for idx, col, full in split_assign:
+    df.loc[idx, col] = full
+
+# treat physically impossible tracking readings as missing (same rule for every platform)
+df, n_screened = screen_outliers(df)
+if n_screened:
+    st.caption(
+        f"{n_screened} tracking reading(s) outside plausible ranges were treated as missing "
+        f"(velo outside {PLAUSIBLE_RANGES['RelSpeed'][0]}–{PLAUSIBLE_RANGES['RelSpeed'][1]} mph, "
+        f"extension outside {PLAUSIBLE_RANGES['Extension'][0]}–{PLAUSIBLE_RANGES['Extension'][1]} ft)."
+    )
 
 # add every derived column the app needs
 df = add_foul_flag(df)
@@ -259,6 +742,17 @@ if available_dates:
 else:
     st.info("No session dates detected in filenames; skipping date filter.")
 
+# let the user filter by platform when both are uploaded
+available_platforms = sorted(df["Source"].dropna().unique())
+if len(available_platforms) > 1:
+    selected_platforms = st.multiselect(
+        "Filter by platform:",
+        options=available_platforms,
+        default=available_platforms,
+        help="Velo, spin, extension, etc. read slightly differently on each system."
+    )
+    df = df[df["Source"].isin(selected_platforms)]
+
 # label used to tag and name the CSV exports
 game_label = st.text_input(
     "Game / session label (tags every exported CSV and its filename):",
@@ -267,6 +761,11 @@ game_label = st.text_input(
 )
 label_slug = slugify(game_label)
 
+# rows each tab draws from: with Georgetown-only on, a pitcher's GU pitching rows / a hitter's GU batting rows
+gu_pitch_rows, gu_bat_rows = gu_row_masks(df)
+pitch_df = df[gu_pitch_rows] if gu_only else df
+bat_df   = df[gu_bat_rows]   if gu_only else df
+
 # two tabs: pitcher report and hitter dashboard
 tab_pitcher, tab_hitter = st.tabs(["🎯 Pitcher Report", "🏏 Hitter Dashboard"])
 
@@ -274,21 +773,23 @@ tab_pitcher, tab_hitter = st.tabs(["🎯 Pitcher Report", "🏏 Hitter Dashboard
 with tab_pitcher:
     st.subheader("Pitcher Report Generator (All Players)")
 
-    pitchers = sorted(df["Pitcher"].dropna().unique())
+    pitchers = sorted(pitch_df["Pitcher"].dropna().unique())
     if not pitchers:
         st.warning("No pitchers found in the dataset.")
         st.stop()
 
     selected_pitcher = st.selectbox("Select a pitcher:", pitchers)
 
-    p = df[df["Pitcher"] == selected_pitcher].copy()
+    p = pitch_df[pitch_df["Pitcher"] == selected_pitcher].copy()
     if p.empty:
         st.warning("No data for this pitcher.")
         st.stop()
 
     p = p[p["TaggedPitchType"].notna()]
     p = p[p["RelSpeed"].notna()]
-    p = p.sort_values("PitchNo").reset_index(drop=True)
+    # keep sessions in order: date, then file, then pitch number within the file
+    pitch_order = ["SessionDate", "SourceFile", "PitchNo"]
+    p = p.sort_values(pitch_order).reset_index(drop=True)
     p["PitchNo"] = range(1, len(p) + 1)
 
     p["IsCalledStrike"]   = p["PitchCall"].eq("StrikeCalled")
@@ -310,7 +811,7 @@ with tab_pitcher:
 
     # keep only the selected pitch types
     p_plot = p[p["TaggedPitchType"].isin(selected_pitch_types)].copy()
-    p_plot = p_plot.sort_values("PitchNo").reset_index(drop=True)
+    p_plot = p_plot.sort_values(pitch_order).reset_index(drop=True)
     p_plot["PitchNo"] = range(1, len(p_plot) + 1)
 
     # numbers for the summary strip at the top of the report
@@ -471,6 +972,7 @@ with tab_pitcher:
     ax_header.axis("off")
     ax_header.text(0, 0.65, selected_pitcher, fontsize=26, weight="bold")
     ax_header.text(0.78, 0.60, f"Outing Summary\n{season_range}", fontsize=14, ha="right")
+    ax_header.text(0.78, 0.05, f"Data: {platform_label(p_plot)}", fontsize=11, ha="right")
 
     ax_sum = fig.add_subplot(gs[1, :])
     ax_sum.axis("off")
@@ -648,6 +1150,7 @@ with tab_pitcher:
     report_df["Count"] = report_df["Count"].astype("Int64")
     report_df.insert(0, "Game", game_label)
     report_df.insert(1, "Player", selected_pitcher)
+    report_df.insert(2, "Data", platform_label(p_plot))
 
     st.download_button(
         "Download Report Data (CSV)",
@@ -664,14 +1167,14 @@ with tab_hitter:
     WHIFF_CALLS   = {"StrikeSwinging"}
     CONTACT_CALLS = {"Foul", "InPlay"}
 
-    hitters = sorted(df["Batter"].dropna().unique())
+    hitters = sorted(bat_df["Batter"].dropna().unique())
     if not hitters:
         st.warning("No hitters found in the dataset.")
         st.stop()
 
     selected_hitter = st.selectbox("Select a hitter:", hitters)
 
-    h = df[df["Batter"] == selected_hitter].copy()
+    h = bat_df[bat_df["Batter"] == selected_hitter].copy()
     if h.empty:
         st.warning("No data for this hitter.")
         st.stop()
@@ -760,7 +1263,7 @@ with tab_hitter:
     show_tbl["Avg LA"]     = show_tbl["Avg LA"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}")
 
     st.markdown("### By Pitch Type")
-    st.dataframe(show_tbl, use_container_width=True)
+    st.dataframe(show_tbl, width="stretch")
 
     # strike zone plot of notable pitches
     st.markdown("### Strike Zone Plot: Hard-Hit Swings (EV 90+), Chases, Whiffs, and Called Strikes")
@@ -898,6 +1401,7 @@ with tab_hitter:
 
     axh.text(0, 0.65, selected_hitter, fontsize=26, weight="bold")
     axh.text(0.97, 0.60, f"Performance Summary\n{season_range}", fontsize=14, ha="right")
+    axh.text(0.97, 0.25, f"Data: {platform_label(h)}", fontsize=11, ha="right")
 
     hitter_kpi_labels = ["Chase%", "Z-Contact%", "Max EV", "Avg LA", "90th % EV"]
     hitter_kpi_values = [
@@ -1034,6 +1538,7 @@ with tab_hitter:
             hitter_report[c] = pd.to_numeric(hitter_report[c], errors="coerce").round(1)
     hitter_report.insert(0, "Game", game_label)
     hitter_report.insert(1, "Player", selected_hitter)
+    hitter_report.insert(2, "Data", platform_label(h))
 
     st.download_button(
         "Download Report Data (CSV)",
@@ -1041,4 +1546,3 @@ with tab_hitter:
         file_name=f"{label_slug}_{slugify(selected_hitter)}_hitting.csv",
         mime="text/csv"
     )
-

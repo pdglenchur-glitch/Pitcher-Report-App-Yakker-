@@ -1,3 +1,4 @@
+# imports
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -1191,6 +1192,7 @@ with tab_hitter:
     h["IsChase"]    = h["IsSwing"] & (h["ZoneLocKnown"]) & (~h["InZone"])
     h["IsZSwing"]   = h["IsSwing"]   & (h["ZoneLocKnown"]) & (h["InZone"])
     h["IsZContact"] = h["IsContact"] & (h["ZoneLocKnown"]) & (h["InZone"])
+    h["IsOutZone"]  = h["ZoneLocKnown"] & (~h["InZone"])
 
     # overall hitter totals
     total_pitches   = len(h)
@@ -1199,9 +1201,11 @@ with tab_hitter:
     total_chases    = int(h["IsChase"].sum())
     total_z_swings  = int(h["IsZSwing"].sum())
     total_z_contact = int(h["IsZContact"].sum())
+    total_out_zone  = int(h["IsOutZone"].sum())
 
     overall_whiff     = pct(total_whiffs,    total_swings)
     overall_chase     = pct(total_chases,    total_pitches)
+    overall_o_swing   = pct(total_chases,    total_out_zone)
     overall_z_contact = pct(total_z_contact, total_z_swings)
 
     exit_speed_all   = pd.to_numeric(h["ExitSpeed"], errors="coerce")
@@ -1211,16 +1215,18 @@ with tab_hitter:
     ev_90th          = float(exit_speed_all.quantile(0.90)) if exit_speed_all.notna().any() else np.nan
 
     # KPI row at the top of the tab
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Overall Chase%",   format_pct(overall_chase))
-    m2.metric("Z-Contact%",       format_pct(overall_z_contact))
-    m3.metric("Max EV (Overall)", format_num(max_ev_overall, 1))
-    m4.metric("Avg Launch Angle", format_num(avg_launch_angle, 1))
-    m5.metric("90th % EV",        format_num(ev_90th, 1))
+    m2.metric("O-Swing%",         format_pct(overall_o_swing))
+    m3.metric("Z-Contact%",       format_pct(overall_z_contact))
+    m4.metric("Max EV (Overall)", format_num(max_ev_overall, 1))
+    m5.metric("Avg Launch Angle", format_num(avg_launch_angle, 1))
+    m6.metric("90th % EV",        format_num(ev_90th, 1))
 
     st.caption(
         "Whiff% = Swinging Strikes / All Swings, where Swings = {StrikeSwinging, Foul, InPlay}. "
         "Chase% = (Swings on out-of-zone pitches) / (All pitches). "
+        "O-Swing% = (Swings on out-of-zone pitches) / (Out-of-zone pitches), the TrackMan-style chase rate. "
         "Z-Contact% = (In-zone swings with contact) / (All in-zone swings), where contact = {Foul, InPlay}. "
         "Zone matches pitcher report PZR. EV excludes any row tagged 'foul' anywhere in the row only for BIP-specific metrics."
     )
@@ -1235,6 +1241,7 @@ with tab_hitter:
         z_contact = int(g["IsZContact"].sum())
         whiff_pct     = pct(whiffs,    swings)
         chase_pct     = pct(chases,    pitches)
+        o_swing_pct   = pct(chases,    int(g["IsOutZone"].sum()))
         z_contact_pct = pct(z_contact, z_swings)
         bip    = int(g["IsBIP"].sum())
         avg_ev = safe_mean(g.loc[g["IsBIP"], "ExitSpeed"])
@@ -1242,6 +1249,7 @@ with tab_hitter:
         return pd.Series({
             "Pitches":    pitches, "Swings":  swings,  "Whiffs":     whiffs,
             "Whiff%":     whiff_pct, "Chases": chases,  "Chase%":     chase_pct,
+            "O-Swing%":   o_swing_pct,
             "Z-Contact%": z_contact_pct, "BIP": bip,
             "Avg EV":     avg_ev,  "Avg LA":  avg_la
         })
@@ -1258,6 +1266,7 @@ with tab_hitter:
     show_tbl = by_pitch.copy()
     show_tbl["Whiff%"]     = show_tbl["Whiff%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
     show_tbl["Chase%"]     = show_tbl["Chase%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
+    show_tbl["O-Swing%"]   = show_tbl["O-Swing%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
     show_tbl["Z-Contact%"] = show_tbl["Z-Contact%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
     show_tbl["Avg EV"]     = show_tbl["Avg EV"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}")
     show_tbl["Avg LA"]     = show_tbl["Avg LA"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}")
@@ -1302,6 +1311,7 @@ with tab_hitter:
         "Whiff%":      overall_whiff,
         "Chases":      total_chases,
         "Chase%":      overall_chase,
+        "O-Swing%":    overall_o_swing,
         "Z-Contact%":  overall_z_contact,
         "BIP":         int(h["IsBIP"].sum()),
         "Avg EV":      safe_mean(h.loc[h["IsBIP"], "ExitSpeed"]),
@@ -1312,7 +1322,7 @@ with tab_hitter:
 
     desired_cols = [
         "Pitch Type", "Pitches", "Swings", "Whiffs", "Whiff%",
-        "Chases", "Chase%", "Z-Contact%", "BIP", "Avg EV", "Avg LA"
+        "Chases", "Chase%", "O-Swing%", "Z-Contact%", "BIP", "Avg EV", "Avg LA"
     ]
     for c in desired_cols:
         if c not in summary_for_png.columns:
@@ -1338,6 +1348,7 @@ with tab_hitter:
                 result[f"{label}\nAvg EV"] = np.nan
                 result[f"{label}\nAvg LA"] = np.nan
                 result[f"{label}\nChase%"] = np.nan
+                result[f"{label}\nO-Swing%"] = np.nan
             else:
                 swings_h = int(g["IsSwing"].sum())
                 whiffs_h = int(g["IsWhiff"].sum())
@@ -1345,6 +1356,7 @@ with tab_hitter:
                 result[f"{label}\nAvg EV"] = safe_mean(g.loc[g["IsBIP"], "ExitSpeed"])
                 result[f"{label}\nAvg LA"] = safe_mean(g.loc[g["IsBIP"], "Angle"])
                 result[f"{label}\nChase%"] = pct(int(g["IsChase"].sum()), len(g))
+                result[f"{label}\nO-Swing%"] = pct(int(g["IsChase"].sum()), int(g["IsOutZone"].sum()))
         return result
 
     hand_rows_h = [{"Pitch Type": "Overall", **hand_split_metrics(h)}]
@@ -1361,13 +1373,14 @@ with tab_hitter:
             f"{label}\nWhiff%",
             f"{label}\nAvg EV",
             f"{label}\nAvg LA",
-            f"{label}\nChase%"
+            f"{label}\nChase%",
+            f"{label}\nO-Swing%"
         ]
     hand_display_cols_h = ["Pitch Type"] + hand_stat_cols_h
 
     hand_df_h_fmt = hand_df_h[hand_display_cols_h].copy()
     for col in hand_stat_cols_h:
-        if "Whiff%" in col or "Chase%" in col:
+        if "Whiff%" in col or "Chase%" in col or "O-Swing%" in col:
             hand_df_h_fmt[col] = hand_df_h_fmt[col].map(
                 lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
         else:
@@ -1391,7 +1404,7 @@ with tab_hitter:
 
     gs_tables_h = gridspec.GridSpecFromSubplotSpec(
         1, 2, subplot_spec=gs_combo[4, 0],
-        wspace=0.08, width_ratios=[1.15, 0.85]
+        wspace=0.08, width_ratios=[1.0, 1.0]
     )
     ax_tbl_orig = fig_combo.add_subplot(gs_tables_h[0, 0])
     ax_tbl_hand = fig_combo.add_subplot(gs_tables_h[0, 1])
@@ -1403,16 +1416,18 @@ with tab_hitter:
     axh.text(0.97, 0.60, f"Performance Summary\n{season_range}", fontsize=14, ha="right")
     axh.text(0.97, 0.25, f"Data: {platform_label(h)}", fontsize=11, ha="right")
 
-    hitter_kpi_labels = ["Chase%", "Z-Contact%", "Max EV", "Avg LA", "90th % EV"]
+    hitter_kpi_labels = ["Chase%", "O-Swing%", "Z-Contact%", "Max EV", "Avg LA", "90th % EV"]
     hitter_kpi_values = [
-        format_pct(overall_chase), format_pct(overall_z_contact),
+        format_pct(overall_chase), format_pct(overall_o_swing), format_pct(overall_z_contact),
         format_num(max_ev_overall, 1), format_num(avg_launch_angle, 1), format_num(ev_90th, 1)
     ]
     num_boxes = len(hitter_kpi_labels)
     for i, (lab, val) in enumerate(zip(hitter_kpi_labels, hitter_kpi_values)):
         x_left = i / num_boxes; width = 1 / num_boxes
         axk.text(x_left + width / 2, 0.72, lab, fontsize=11, ha="center", weight="bold")
-        axk.add_patch(plt.Rectangle((x_left + 0.06, 0.18), width - 0.12, 0.42, fill=False, linewidth=1))
+        # margin scales with the box so values like "100.0%" still fit when there are more boxes
+        pad = width * 0.15
+        axk.add_patch(plt.Rectangle((x_left + pad, 0.18), width - 2 * pad, 0.42, fill=False, linewidth=1))
         axk.text(x_left + width / 2, 0.34, val, fontsize=12, ha="center")
 
     axz.axvline(-8.5, color="black", linestyle="--", linewidth=0.9)
@@ -1471,6 +1486,7 @@ with tab_hitter:
     table_display = summary_for_png.copy()
     table_display["Whiff%"]     = table_display["Whiff%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
     table_display["Chase%"]     = table_display["Chase%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
+    table_display["O-Swing%"]   = table_display["O-Swing%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
     table_display["Z-Contact%"] = table_display["Z-Contact%"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
     table_display["Avg EV"]     = table_display["Avg EV"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}")
     table_display["Avg LA"]     = table_display["Avg LA"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}")
@@ -1488,7 +1504,7 @@ with tab_hitter:
     )
     tbl_orig.auto_set_font_size(False)
     tbl_orig.auto_set_column_width(col=list(range(len(table_display.columns))))
-    tbl_orig.set_fontsize(8.5)
+    fit_table_fontsize(tbl_orig, ax_tbl_orig, min_fontsize=6, start_fontsize=8.5)
     tbl_orig.scale(1.0, 1.3)
 
     ax_tbl_hand.text(0.5, 0.97, "Split by Pitcher Handedness",
@@ -1506,7 +1522,7 @@ with tab_hitter:
         )
         tbl_hand.auto_set_font_size(False)
         tbl_hand.auto_set_column_width(col=list(range(len(hand_display_cols_h))))
-        tbl_hand.set_fontsize(8.5)
+        fit_table_fontsize(tbl_hand, ax_tbl_hand, min_fontsize=6, start_fontsize=8.5)
         tbl_hand.scale(1.0, 1.3)
 
     st.pyplot(fig_combo)
